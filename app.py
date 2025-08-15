@@ -1,54 +1,53 @@
 import os
 import threading
 from flask import Flask
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,  # ¡en v20 es en minúsculas!
+)
 
-# === Config ===
-TOKEN = os.environ.get("TELEGRAM_TOKEN")  # lo pondremos en Railway → Variables
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # opcional
+# ---- Handlers de Telegram ----
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("¡Hola! Soy Aureia_bot y ya estoy viva aquí 💜")
 
-# === Bot logic ===
-def start(update, context):
-    update.message.reply_text(
-        "¡Hola! Soy Aureia. Ya estoy viva en Telegram 🪄.\n"
-        "Escríbeme y te respondo. /help para ver opciones."
-    )
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("pong")
 
-def help_cmd(update, context):
-    update.message.reply_text(
-        "Comandos:\n"
-        "/start – saludar\n"
-        "/help – esta ayuda"
-    )
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Responde con lo mismo que escribas (para probar que está vivo)
+    await update.message.reply_text(update.message.text)
 
-def handle_text(update, context):
-    text = update.message.text.strip()
-    # Aquí más tarde conectaremos con 'mi yo' de ChatGPT si quieres.
-    update.message.reply_text(f"Me dijiste: “{text}”. (Eco de prueba ✅)")
+def make_bot_app() -> Application:
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("Falta la variable TELEGRAM_BOT_TOKEN en Railway → Variables.")
 
-# === Telegram runner (long polling) ===
-def run_bot():
-    if not TOKEN:
-        raise RuntimeError("Falta TELEGRAM_TOKEN (variable de entorno).")
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    return app
 
-    updater = Updater(token=TOKEN, use_context=True)
-    dp = updater.dispatcher
+# ---- Mini servidor web para que Railway vea un puerto abierto ----
+web = Flask(__name__)
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+@web.get("/")
+def home():
+    return "Aureia_bot OK"
 
-    updater.start_polling()
-    updater.idle()
-
-# === Keep-alive web server (Railway espera un puerto abierto) ===
-app = Flask(__name__)
-
-@app.route("/")
-def root():
-    return "Aureia-bot running ✔"
+def run_polling():
+    bot_app = make_bot_app()
+    # Ejecutamos el bot en modo polling (simple y robusto en Railway)
+    bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    # Lanzamos el bot en un hilo
+    threading.Thread(target=run_polling, daemon=True).start()
+
+    # Servidor web para el health check de Railway
+    port = int(os.getenv("PORT", 8080))
+    web.run(host="0.0.0.0", port=port)
