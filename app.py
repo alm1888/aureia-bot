@@ -1,13 +1,15 @@
 import os
 import threading
+import asyncio
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# --- Vars ---
-TOKEN = os.environ["BOT_TOKEN"]
+# --- Tokens de entorno ---
+TOKEN = os.environ["BOT_TOKEN"]  # ya lo tienes en Railway
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]  # lo añadirás ahora
 
 # --- Mini servidor keep-alive ---
 flask_app = Flask(__name__)
@@ -19,30 +21,54 @@ def index():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
-# --- Handlers de Telegram ---
+# --- OpenAI (SDK v1) ---
+from openai import OpenAI
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hola 👋 Soy Aureia. Envíame un mensaje.")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Por si acaso, ignora si empieza con "/"
-    if update.message.text.startswith("/"):
+async def chat_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Responde con IA a cualquier texto que no sea comando."""
+    user_text = (update.message.text or "").strip()
+    if not user_text:
         return
-    await update.message.reply_text(f"Me dijiste: {update.message.text}")
+
+    def _ask():
+        return client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system",
+                 "content": "Eres Aureia, una asistente breve, amable y útil. Responde en español de forma natural."},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+
+    try:
+        resp = await asyncio.to_thread(_ask)  # ejecuta la llamada bloqueante en un hilo
+        answer = resp.choices[0].message.content.strip()
+    except Exception as e:
+        answer = "Ahora mismo no puedo pensar 😅. Intenta de nuevo en un rato."
+
+    await update.message.reply_text(answer)
 
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # 1) Registra primero los comandos
+    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
 
-    # 2) Luego el eco, EXCLUYENDO comandos
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    # Mensajes normales -> IA (excluye comandos)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_ai))
 
-    # 3) Arranca Flask en segundo plano y el polling
+    # Keep alive + polling
     threading.Thread(target=run_flask, daemon=True).start()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
