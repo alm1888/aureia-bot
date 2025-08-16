@@ -1,76 +1,81 @@
+# app.py
 import os
-import threading
-import asyncio
-from flask import Flask
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
-)
-
-# --- Tokens de entorno ---
-TOKEN = os.environ["BOT_TOKEN"]  # ya lo tienes en Railway
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]  # lo añadirás ahora
-
-# --- Mini servidor keep-alive ---
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def index():
-    return "OK", 200
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-# --- OpenAI (SDK v1) ---
+import json
+import requests
+from flask import Flask, request, jsonify
 from openai import OpenAI
+
+# ========= Config =========
+BOT_TOKEN = os.environ["BOT_TOKEN"]               # en Railway
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]     # en Railway
+
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+app = Flask(__name__)
+
+# Cliente OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hola 👋 Soy Aureia. Envíame un mensaje.")
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
-
-async def chat_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Responde con IA a cualquier texto que no sea comando."""
-    user_text = (update.message.text or "").strip()
-    if not user_text:
-        return
-
-    def _ask():
-        return client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system",
-                 "content": "Eres Aureia, una asistente breve, amable y útil. Responde en español de forma natural."},
-                {"role": "user", "content": user_text}
-            ],
-            temperature=0.7,
-            max_tokens=300
-        )
-
+# ========= Utilidades Telegram =========
+def send_message(chat_id: int, text: str, reply_to: int | None = None):
     try:
-        resp = await asyncio.to_thread(_ask)  # ejecuta la llamada bloqueante en un hilo
-        answer = resp.choices[0].message.content.strip()
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=20)
+        if r.status_code != 200:
+            print("TELEGRAM ERROR >>>", r.status_code, r.text)
     except Exception as e:
-        answer = "Ahora mismo no puedo pensar 😅. Intenta de nuevo en un rato."
+        print("TELEGRAM EXCEPTION >>>", repr(e))
 
-    await update.message.reply_text(answer)
+# ========= OpenAI =========
+def generar_respuesta(texto_usuario: str) -> str:
+    """Llama al modelo y devuelve texto. Loguea cualquier error."""
+    try:
+        r = client.responses.create(
+            model="gpt-4o-mini",
+            input=f"Eres Aureia, una asistente amable. Responde en español. Usuario: {texto_usuario}"
+        )
+        return r.output_text.strip()
+    except Exception as e:
+        # ESTE LOG ES CLAVE: míralo en Railway -> Logs
+        print("OpenAI ERROR >>>", repr(e))
+        return "Ahora mismo no puedo pensar 😅. Intenta de nuevo en un rato."
 
-def main():
-    app = Application.builder().token(TOKEN).build()
+# ========= Rutas =========
+@app.get("/")
+def root():
+    return "OK", 200
 
-    # Comandos
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
+@app.post("/webhook")
+def webhook():
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+        message = update.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        msg_id = message.get("message_id")
+        text = message.get("text", "")
 
-    # Mensajes normales -> IA (excluye comandos)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_ai))
+        if not chat_id or not text:
+            return jsonify(ok=True)  # nada que hacer
 
-    # Keep alive + polling
-    threading.Thread(target=run_flask, daemon=True).start()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Comandos simples
+        if text.strip().lower() == "/ping":
+            send_message(chat_id, "pong", reply_to=msg_id)
+            return jsonify(ok=True)
+        if text.strip().lower().startswith("/start"):
+            send_message(chat_id, "Hola 👋 Soy Aureia. Envíame un mensaje.", reply_to=msg_id)
+            return jsonify(ok=True)
 
+        # Respuesta con OpenAI
+        respuesta = generar_respuesta(text)
+        send_message(chat_id, respuesta, reply_to=msg_id)
+        return jsonify(ok=True)
+
+    except Exception as e:
+        print("WEBHOOK ERROR >>>", repr(e))
+        return jsonify(ok=True)
+
+# ========= Main (para ejecución local) =========
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
