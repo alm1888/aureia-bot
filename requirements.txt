@@ -1,4 +1,5 @@
 flask
 python-telegram-bot==13.15
 requests
+openai>=1.40.0
 gunicorn
