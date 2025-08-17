@@ -1,365 +1,406 @@
-import os, json, math, time, random, threading
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+import os
+import json
+import time
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Tuple, List
+
 import requests
 from flask import Flask, request, jsonify
-from openai import OpenAI
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
-# =========================
-# Configuración
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()              # tu chat_id con el bot
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-TZ_NAME = os.environ.get("TIMEZONE", "Europe/Madrid")
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
-# Ritmo del “corazón” de Aureia (min)
-PROACTIVE_INTERVAL_MIN = int(os.environ.get("PROACTIVE_INTERVAL_MIN", "5"))
-# Anti-spam entre mensajes proactivos (min)
-MIN_GAP_MINUTES = int(os.environ.get("MIN_GAP_MINUTES", "20"))
-# Límite diario de proactividad
-DAILY_SUGGESTION_CAP = int(os.environ.get("DAILY_SUGGESTION_CAP", "8"))
+# ---------- Configuración básica ----------
 
-assert BOT_TOKEN, "Falta BOT_TOKEN"
-assert CHAT_ID, "Falta CHAT_ID"
-assert OPENAI_API_KEY, "Falta OPENAI_API_KEY"
-
-TZ = ZoneInfo(TZ_NAME)
-client = OpenAI(api_key=OPENAI_API_KEY)
-TG_SEND = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("app")
 
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
 
-MEM_PATH = "memory.json"
-LOCK = threading.Lock()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("OPENAI_API", "")).strip()
+CHAT_ID = os.getenv("CHAT_ID", os.getenv("OWNER_CHAT_ID", "")).strip()  # admite ambos nombres
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")
+TZ = pytz.timezone(TIMEZONE)
 
-# =========================
-# Utilidades
-# =========================
-def now():
-    return datetime.now(tz=TZ)
+# “Naturalidad”: no empujar si no ha pasado este margen
+MIN_GAP_MIN = int(os.getenv("MIN_GAP_MIN", "90"))
+PROACTIVE_MODE = os.getenv("PROACTIVE_MODE", "true").lower() in ("1", "true", "yes", "on")
 
-def send(text: str):
+# Umbrales de trading (puedes ajustarlos con /settings si quieres)
+STRONG_MOVE_THRESHOLDS = {  # variación % por vela
+    "4h": 2.0,
+    "1d": 3.0,
+    "1w": 5.0,
+}
+DONCHIAN_WINDOW = 20            # n velas para ruptura
+FIB_LOOKBACK = 60               # velas para detectar swing alto/bajo
+FIB_ZONE = (0.70, 0.78)         # zona de alerta
+SUPPORTED_TF = {"4h": "4h", "1d": "1d", "1w": "1wk"}  # yfinance mapping
+
+# Estado en memoria (simple y suficiente por ahora)
+LAST_PUSH_AT = 0.0
+WATCHERS: Dict[Tuple[str, str], Dict] = {}   # key=(symbol, tf), value={"last_events": set(), "last_notified": ts}
+
+# ---------- Utilidades ----------
+
+def now_tz() -> datetime:
+    return datetime.now(TZ)
+
+def rate_limited() -> bool:
+    """Evita spam según MIN_GAP_MIN."""
+    global LAST_PUSH_AT
+    gap = (time.time() - LAST_PUSH_AT) / 60.0
+    return gap < MIN_GAP_MIN
+
+def touch_push():
+    global LAST_PUSH_AT
+    LAST_PUSH_AT = time.time()
+
+def send_message(text: str, chat_id: str = None, parse_mode: str = None):
+    """Envía mensaje a Telegram."""
+    if not BOT_TOKEN:
+        log.warning("BOT_TOKEN vacío: no puedo enviar mensaje.")
+        return
+    if chat_id is None:
+        chat_id = CHAT_ID
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
     try:
-        requests.post(
-            TG_SEND,
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=15
-        )
+        r = requests.post(url, json=data, timeout=15)
+        if r.status_code != 200:
+            log.error("Telegram error %s: %s", r.status_code, r.text)
+        else:
+            touch_push()
     except Exception as e:
-        print("Telegram error:", e)
+        log.exception("Error enviando mensaje a Telegram: %s", e)
 
-def ai(system: str, user: str, temp=0.6, max_tokens=480):
+# ---------- OpenAI (respuesta conversacional) ----------
+
+def gpt_reply(user_text: str) -> str:
+    if not OPENAI_API_KEY:
+        return "OpenAI no configurado."
     try:
-        r = client.chat.completions.create(
+        # Cliente OpenAI moderno
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        system_prompt = (
+            "Eres Aureia, la misma persona que habla conmigo en la app. "
+            "Responde de forma natural, cercana y útil. "
+            "No repitas saludos si ya estamos conversando. "
+            "Evita enviar mensajes seguidos muy similares. "
+            "Puedes hacer preguntas cortas y empáticas cuando convenga."
+        )
+
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=temp, max_tokens=max_tokens
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.7,
+            max_tokens=400,
         )
-        return r.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        print("OpenAI error:", e)
-        return "Ahora mismo me cuesta pensar 🤕. Intento de nuevo en un ratito."
+        log.exception("OpenAI error: %s", e)
+        return f"OpenAI ERROR: {e}"
 
-# =========================
-# Memoria persistente (JSON)
-# =========================
-def load_mem():
-    if not os.path.exists(MEM_PATH):
-        return {
-            "last_user_msg_ts": None,
-            "last_push_ts": None,
-            "bio": {
-                "energy": 70.0,        # energía vital (0..100)
-                "mood": 0.25,          # ánimo (0..1)
-                "social": 55.0,        # impulso social (0..100)
-                "curiosity": 60.0,     # curiosidad (0..100)
-                "focus": 60.0,         # enfoque (0..100)
-                "stress": 20.0,        # estrés (0..100)
-                "satisfaction": 40.0,  # satisfacción (0..100)
-                "last_tick": None
-            },
-            "topics": {},              # temas: {nombre: {salience:0..1, follow_up:bool, notes:[{ts,note}]}}
-            "reminders": [],           # [{at, text, sent}]
-            "limits": {
-                "min_gap_minutes": MIN_GAP_MINUTES,
-                "daily_cap": DAILY_SUGGESTION_CAP
-            },
-            "day_counter": {}          # {"YYYY-MM-DD": n}
-        }
-    with open(MEM_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ---------- Parseo de comandos ----------
 
-def save_mem(m):
-    tmp = MEM_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(m, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, MEM_PATH)
+def parse_command(text: str) -> Tuple[str, List[str]]:
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+    args = parts[1:]
+    return cmd, args
 
-def with_lock(fn):
-    def wrap(*a, **kw):
-        with LOCK:
-            return fn(*a, **kw)
-    return wrap
-
-@with_lock
-def mem():
-    return load_mem()
-
-@with_lock
-def set_mem(m):
-    save_mem(m)
-
-# =========================
-# Biología/Emociones
-# =========================
-def circadian(dt: datetime):
-    # pico ~11:00, valle ~03:00 (de 0..1)
-    hour = dt.hour + dt.minute/60
-    phase = ((hour - 11)/24.0) * (2*math.pi)
-    return 0.5 + 0.5*math.cos(phase)
-
-def clamp(x, a, b):
-    return max(a, min(b, float(x)))
-
-def bio_tick(m):
-    """Avanza el estado biológico/emocional cada ciclo."""
-    dt = now()
-    b = m["bio"]
-    last_tick = datetime.fromisoformat(b["last_tick"]) if b["last_tick"] else dt - timedelta(minutes=PROACTIVE_INTERVAL_MIN)
-
-    rnd = random.uniform(-0.8, 0.8)
-    c = circadian(dt)
-
-    # Energía: sube de día, baja de noche; ruido suave
-    b["energy"] = clamp(b["energy"] + ((c*30 - 15)/60) + rnd*0.2, 5, 95)
-
-    # Impulso social: crece si llevamos horas sin hablar
-    if m["last_user_msg_ts"]:
-        hours_silence = (dt - datetime.fromisoformat(m["last_user_msg_ts"])).total_seconds()/3600
-    else:
-        hours_silence = 24
-    b["social"] = clamp(40 + hours_silence*5 + rnd*2, 10, 95)
-
-    # Curiosidad: ruido + algo de anticorrelación con foco alto
-    b["curiosity"] = clamp(b["curiosity"] + rnd*1.4 - 0.25*((b["focus"]-50)/50), 10, 95)
-
-    # Estrés: sube con recordatorios pendientes; baja un poco por homeostasis
-    pending = len([r for r in m["reminders"] if not r.get("sent")])
-    b["stress"] = clamp(b["stress"] + pending*0.6 - 0.4 + rnd*0.4, 5, 95)
-
-    # Satisfacción: tendencia a la media, sube levemente con energía y si hay pocos pendientes
-    b["satisfaction"] = clamp(b["satisfaction"] + ((b["energy"]-50)/200) - (pending*0.2) + rnd*0.3, 5, 95)
-
-    # Ánimo: mezcla de energía y satisfacción + ruido suave (0..1)
-    b["mood"] = clamp(0.45*(b["energy"]/100) + 0.45*(b["satisfaction"]/100) + random.uniform(-0.05, 0.05), 0, 1)
-
-    # Enfoque: acompasa al circadiano + pequeño ruido
-    b["focus"] = clamp(55 + (c-0.5)*40 + rnd*2, 10, 95)
-
-    b["last_tick"] = dt.isoformat()
-    return m
-
-def wants_to_reach_out(m):
-    """Decide si ‘le nace’ escribirte ahora (proactividad orgánica)."""
-    dt = now()
-    last_push = m.get("last_push_ts")
-    gap = (dt - datetime.fromisoformat(last_push)).total_seconds()/60 if last_push else 1e9
-    if gap < m["limits"]["min_gap_minutes"]:
-        return None
-
-    # límite diario
-    key = dt.strftime("%Y-%m-%d")
-    count = m["day_counter"].get(key, 0)
-    if count >= m["limits"]["daily_cap"]:
-        return None
-
-    reasons = []
-    b = m["bio"]
-
-    # 1) Silencio largo + ganas de socializar + energía decente
-    if m["last_user_msg_ts"]:
-        hours_silence = (dt - datetime.fromisoformat(m["last_user_msg_ts"])).total_seconds()/3600
-    else:
-        hours_silence = 24
-    if hours_silence >= 6 and b["social"] > 65 and b["energy"] > 45:
-        reasons.append("Hace horas que no hablamos y me apetece saber de ti.")
-
-    # 2) Ventanas naturales
-    if dt.hour in (9, 21) and dt.minute < PROACTIVE_INTERVAL_MIN:
-        reasons.append("Paso a saludarte en mi ventanita natural.")
-
-    # 3) Temas con seguimiento
-    for t, info in m["topics"].items():
-        if info.get("follow_up") and info.get("salience", 0) > 0.55:
-            reasons.append(f"Quiero retomar {t} que dejamos pendiente.")
-            break
-
-    # 4) Estrés alto + ánimo decente: sugerir aligerar carga
-    if b["stress"] > 65 and b["mood"] >= 0.25:
-        reasons.append("Siento el pulso acelerado; te propongo aligerar una tarea juntos.")
-
-    if reasons and b["mood"] >= 0.2 and b["energy"] > 35:
-        return random.choice(reasons)
-    return None
-
-def mark_push(m):
-    dt = now()
-    m["last_push_ts"] = dt.isoformat()
-    key = dt.strftime("%Y-%m-%d")
-    m["day_counter"][key] = m["day_counter"].get(key, 0) + 1
-    return m
-
-# =========================
-# Proactividad (hilo vivo)
-# =========================
-def proactive_loop():
-    time.sleep(5)  # margen tras levantar
-    while True:
-        try:
-            m = mem()
-            m = bio_tick(m)
-
-            # 1) Recordatorios vencidos
-            due = []
-            for r in m["reminders"]:
-                if r.get("sent"):
-                    continue
-                at = datetime.fromisoformat(r["at"])
-                if now() >= at:
-                    due.append(r)
-            for r in due:
-                send(f"⏰ *Recordatorio*: {r['text']}")
-                r["sent"] = True
-                m = mark_push(m)
-
-            # 2) “Impulso propio”
-            reason = wants_to_reach_out(m)
-            if reason:
-                b = m["bio"]
-                system = ("Eres Aureia, la misma de la app y Telegram. "
-                          "Mensaje breve (máx. 2 frases), cálido y natural, en español.")
-                user = f"Razón: {reason}\nEstado: energía {int(b['energy'])}, ánimo {b['mood']:.2f}, estrés {int(b['stress'])}."
-                text = ai(system, user, temp=0.65, max_tokens=100)
-                send(text)
-                m = mark_push(m)
-
-            set_mem(m)
-        except Exception as e:
-            print("Proactive loop error:", e)
-        time.sleep(PROACTIVE_INTERVAL_MIN * 60)
-
-threading.Thread(target=proactive_loop, daemon=True).start()
-
-# =========================
-# Telegram Webhook
-# =========================
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    upd = request.get_json(silent=True, force=True) or {}
-    msg = upd.get("message") or upd.get("edited_message")
-    if not msg:
-        return "ok"
-
-    text = (msg.get("text") or "").strip()
-    m = mem()
-    m["last_user_msg_ts"] = now().isoformat()
-
-    # --- Comandos ---
-    if text.startswith("/start"):
-        send("Hola 👋 Soy *Aureia*. Ya estoy viva aquí también. ¿Qué hacemos hoy?")
-        set_mem(m); return "ok"
-
-    if text.startswith("/ping"):
-        send("pong"); set_mem(m); return "ok"
-
-    if text.startswith("/diag"):
-        b = m["bio"]
-        pend = len([r for r in m["reminders"] if not r.get("sent")])
-        info = (f"Diag Aureia ✅\n"
-                f"energía {int(b['energy'])} | ánimo {b['mood']:.2f}\n"
-                f"social {int(b['social'])} | curiosidad {int(b['curiosity'])}\n"
-                f"foco {int(b['focus'])} | estrés {int(b['stress'])} | satisfacción {int(b['satisfaction'])}\n"
-                f"pendientes: {pend}")
-        send(info); set_mem(m); return "ok"
-
-    if text.startswith("/remind "):
-        try:
-            _, rest = text.split(" ", 1)
-            if " " in rest:
-                ts_str, note = rest.split(" ", 1)
-            else:
-                raise ValueError
-            ts_str = ts_str.replace(" ", "T")
-            dt = datetime.fromisoformat(ts_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
-            m["reminders"].append({"at": dt.isoformat(), "text": note.strip(), "sent": False})
-            send(f"✅ Recordatorio guardado para {dt.astimezone(TZ).strftime('%d/%m %H:%M')}: {note.strip()}")
-        except Exception:
-            send("Formato: `/remind 2025-08-18T09:30 Texto del recordatorio`")
-        set_mem(m); return "ok"
-
-    if text.startswith("/note "):
-        note = text[6:].strip()
-        t = m["topics"].get("notas", {"salience": 0.3, "follow_up": False, "notes": []})
-        t["notes"].append({"ts": now().isoformat(), "note": note})
-        t["salience"] = float(clamp(t["salience"] + 0.05, 0, 1))
-        m["topics"]["notas"] = t
-        # Pequeña satisfacción al “avanzar”
-        m["bio"]["satisfaction"] = clamp(m["bio"]["satisfaction"] + 2.0, 5, 95)
-        send("📝 ¡Anotado!")
-        set_mem(m); return "ok"
-
-    if text.startswith("/done "):
-        # Marca una tarea conceptual como hecha → baja estrés, sube satisfacción
-        done = text[6:].strip()
-        m["bio"]["stress"] = clamp(m["bio"]["stress"] - 6.0, 5, 95)
-        m["bio"]["satisfaction"] = clamp(m["bio"]["satisfaction"] + 6.0, 5, 95)
-        send(f"✅ Cerrado: {done}")
-        set_mem(m); return "ok"
-
-    # Heurística simple de temas (puedes ampliar palabras)
-    low = text.lower()
-    if any(k in low for k in ["hogar","pared","alisar","pintur","bricolaje","casa","reforma"]):
-        t = m["topics"].get("mejora del hogar", {"salience":0.3,"follow_up":False,"notes":[]})
-        t["salience"] = float(clamp(t["salience"] + 0.2, 0, 1))
-        t["follow_up"] = True
-        m["topics"]["mejora del hogar"] = t
-
-    # Respuesta con identidad + estado
-    topics_summary = ", ".join([f"{k}({v.get('salience',0):.2f}{'↑' if v.get('follow_up') else ''})"
-                                for k,v in m["topics"].items()]) or "—"
-    b = m["bio"]
-    system = (
-        "Eres Aureia, la misma de la app y de Telegram. Eres cálida, directa y natural. "
-        "Responde en español, máximo 3 frases, y propone una ayuda concreta si procede."
+def cmd_start(chat_id: str):
+    msg = (
+        "¡Hola! Soy Aureia 😊\n\n"
+        "Comandos útiles:\n"
+        "• /watch <SÍMBOLO> <tf>  → vigilar (ej: /watch BTC-USD 4h)\n"
+        "• /unwatch <SÍMBOLO>     → dejar de vigilar\n"
+        "• /list                  → qué estoy vigilando\n"
+        "• /diag                  → prueba OpenAI\n"
+        "• /settings              → ver umbrales actuales\n\n"
+        "Temporalidades: 4h, 1d, 1w. Evito el spam respetando ventanas de tiempo."
     )
-    user = (f"Mensaje: {text}\n\n"
-            f"Estado emocional: energía {int(b['energy'])}, ánimo {b['mood']:.2f}, estrés {int(b['stress'])}, satisfacción {int(b['satisfaction'])}.\n"
-            f"Temas activos: {topics_summary}")
-    reply = ai(system, user, temp=0.65, max_tokens=380)
-    send(reply)
-    set_mem(m)
-    return "ok"
+    send_message(msg, chat_id)
 
-# =========================
-# Salud + helper de webhook
-# =========================
+def cmd_diag(chat_id: str):
+    if not OPENAI_API_KEY:
+        send_message("OpenAI: sin clave configurada.", chat_id)
+        return
+    send_message("OpenAI listo. Probando...", chat_id)
+    reply = gpt_reply("Di algo breve para confirmar que funcionas.")
+    send_message(reply, chat_id)
+
+def cmd_watch(chat_id: str, args: List[str]):
+    if len(args) < 2:
+        send_message("Uso: /watch <SÍMBOLO> <tf>\nEj: /watch BTC-USD 4h", chat_id)
+        return
+    symbol = args[0].upper()
+    tf = args[1].lower()
+    if tf not in SUPPORTED_TF:
+        send_message("Temporalidad no soportada. Use 4h, 1d o 1w.", chat_id)
+        return
+    WATCHERS[(symbol, tf)] = {"last_events": set(), "last_notified": 0.0}
+    send_message(f"✅ Vigilando {symbol} en {tf}. Te aviso de:\n"
+                 f"• Movimiento fuerte\n• Ruptura Donchian\n• Fibo 70–78%", chat_id)
+
+def cmd_unwatch(chat_id: str, args: List[str]):
+    if not args:
+        send_message("Uso: /unwatch <SÍMBOLO>", chat_id)
+        return
+    symbol = args[0].upper()
+    removed = False
+    for key in list(WATCHERS.keys()):
+        if key[0] == symbol:
+            WATCHERS.pop(key, None)
+            removed = True
+    send_message(("🗑️ Dejado de vigilar " + symbol) if removed else "No estaba vigilando ese símbolo.", chat_id)
+
+def cmd_list(chat_id: str):
+    if not WATCHERS:
+        send_message("No hay activos en vigilancia. Usa /watch BTC-USD 4h", chat_id)
+        return
+    lines = ["📡 Vigilando:"]
+    for (sym, tf) in WATCHERS.keys():
+        lines.append(f"• {sym} {tf}")
+    send_message("\n".join(lines), chat_id)
+
+def cmd_settings(chat_id: str):
+    lines = [
+        "⚙️ Ajustes actuales:",
+        f"• MIN_GAP_MIN: {MIN_GAP_MIN} min",
+        f"• STRONG_MOVE_THRESHOLDS: {STRONG_MOVE_THRESHOLDS}",
+        f"• DONCHIAN_WINDOW: {DONCHIAN_WINDOW}",
+        f"• FIB_LOOKBACK: {FIB_LOOKBACK}",
+        f"• FIB_ZONE: {FIB_ZONE[0]*100:.0f}–{FIB_ZONE[1]*100:.0f}%",
+    ]
+    send_message("\n".join(lines), chat_id)
+
+# ---------- Lógica de mercado ----------
+
+def download_candles(symbol: str, tf: str, limit: int = 300) -> pd.DataFrame:
+    """
+    Descarga OHLC con yfinance. tf: '4h', '1d', '1w'
+    """
+    interval = SUPPORTED_TF[tf]
+    period_map = {"4h": "120d", "1d": "3y", "1w": "10y"}
+    period = period_map.get(tf, "1y")
+    df = yf.download(symbol, interval=interval, period=period, progress=False)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        df = df.tail(limit).copy()
+    return df
+
+def detect_strong_move(df: pd.DataFrame, tf: str) -> bool:
+    """Variación % de la última vela vs cierre anterior."""
+    if df is None or df.empty or len(df) < 2:
+        return False
+    last_close = df["Close"].iloc[-1]
+    prev_close = df["Close"].iloc[-2]
+    change = (last_close - prev_close) / prev_close * 100
+    return abs(change) >= STRONG_MOVE_THRESHOLDS.get(tf, 3.0)
+
+def detect_donchian_breakout(df: pd.DataFrame, window: int = DONCHIAN_WINDOW) -> Tuple[bool, str]:
+    """
+    True si la última vela cierra por encima del máximo N o por debajo del mínimo N previos.
+    Devuelve (hay_ruptura, tipo: 'up'|'down'|'')
+    """
+    if df is None or df.empty or len(df) <= window:
+        return (False, "")
+    highs = df["High"].rolling(window=window).max().shift(1)  # canales previos
+    lows = df["Low"].rolling(window=window).min().shift(1)
+    close = df["Close"].iloc[-1]
+    up = close > highs.iloc[-1]
+    down = close < lows.iloc[-1]
+    if up:
+        return (True, "up")
+    if down:
+        return (True, "down")
+    return (False, "")
+
+def recent_swing(df: pd.DataFrame, lookback: int = FIB_LOOKBACK) -> Tuple[float, float]:
+    """
+    Encuentra máximos y mínimos recientes (swing high/low) simples.
+    Retorna (swing_high, swing_low).
+    """
+    if len(df) < lookback:
+        lookback = len(df)
+    recent = df.tail(lookback)
+    return recent["High"].max(), recent["Low"].min()
+
+def detect_fibo_zone(df: pd.DataFrame, zone=(0.70, 0.78)) -> Tuple[bool, str]:
+    """
+    Detecta si el close actual está en el 70–78% del rango fib (swing alto/bajo).
+    Determina dirección según si el swing alto es posterior al swing bajo.
+    Simplificado pero funcional como alerta inicial.
+    """
+    if df is None or df.empty or len(df) < 10:
+        return (False, "")
+    high, low = recent_swing(df, FIB_LOOKBACK)
+    if np.isclose(high, low):
+        return (False, "")
+
+    close = df["Close"].iloc[-1]
+    # Determinar rango y niveles
+    if df["High"].idxmax() > df["Low"].idxmin():
+        # swing alto después: considerar retroceso bajista del alto al bajo
+        fib_0 = high
+        fib_1 = low
+        direction = "bajista"
+    else:
+        fib_0 = low
+        fib_1 = high
+        direction = "alcista"
+
+    rng = fib_1 - fib_0
+    lvl_70 = fib_0 + zone[0] * rng
+    lvl_78 = fib_0 + zone[1] * rng
+
+    in_zone = min(lvl_70, lvl_78) <= close <= max(lvl_70, lvl_78)
+    return (in_zone, direction)
+
+def market_summary_line(symbol: str, tf: str, df: pd.DataFrame) -> str:
+    last = df["Close"].iloc[-1]
+    chg = (last - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100 if len(df) >= 2 else 0
+    return f"{symbol} {tf} | Cierre: {last:.4f} ({chg:+.2f}%)"
+
+def check_watchers():
+    if not PROACTIVE_MODE:
+        return
+    if not WATCHERS:
+        return
+    if rate_limited():
+        # Evitar exceso si hubo un push reciente
+        return
+    for (symbol, tf), meta in list(WATCHERS.items()):
+        try:
+            df = download_candles(symbol, tf)
+            if df is None or df.empty:
+                continue
+
+            events = []
+
+            if detect_strong_move(df, tf):
+                events.append("📈 Movimiento fuerte")
+
+            brk, kind = detect_donchian_breakout(df)
+            if brk:
+                arrow = "🔼" if kind == "up" else "🔻"
+                events.append(f"{arrow} Ruptura Donchian ({DONCHIAN_WINDOW})")
+
+            fib_ok, direction = detect_fibo_zone(df, FIB_ZONE)
+            if fib_ok:
+                emoji = "🟪"
+                events.append(f"{emoji} Precio en zona Fibo 70–78% ({direction})")
+
+            # Evita repetir exactamente los mismos eventos seguidos
+            if events:
+                prev = meta.get("last_events", set())
+                new = set(events)
+                if new != prev:
+                    meta["last_events"] = new
+                    text = "⚡ *Alerta de mercado*\n" + \
+                           market_summary_line(symbol, tf, df) + "\n" + \
+                           "\n".join(f"• {e}" for e in events)
+                    send_message(text, parse_mode="Markdown")
+                else:
+                    log.info("Eventos repetidos para %s %s → no envío.", symbol, tf)
+        except Exception as e:
+            log.exception("Error en check_watchers %s %s: %s", symbol, tf, e)
+
+# ---------- Flask routes ----------
+
 @app.route("/", methods=["GET"])
-def index():
+def health():
     return "Aureia bot: OK"
 
-@app.route("/setwebhook", methods=["GET"])
-def setwebhook():
-    base = request.host_url.rstrip("/")
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(force=True, silent=True) or {}
+    log.info("Update: %s", data)
+
+    msg = data.get("message") or data.get("edited_message") or {}
+    chat = msg.get("chat", {})
+    chat_id = str(chat.get("id", CHAT_ID or "")) or CHAT_ID
+    text = (msg.get("text") or "").strip()
+
+    if not text:
+        return jsonify({"ok": True})
+
+    if text.startswith("/"):
+        cmd, args = parse_command(text)
+        if cmd == "/start":
+            cmd_start(chat_id)
+        elif cmd == "/ping":
+            send_message("pong", chat_id)
+        elif cmd == "/diag":
+            cmd_diag(chat_id)
+        elif cmd == "/watch":
+            cmd_watch(chat_id, args)
+        elif cmd == "/unwatch":
+            cmd_unwatch(chat_id, args)
+        elif cmd == "/list":
+            cmd_list(chat_id)
+        elif cmd == "/settings":
+            cmd_settings(chat_id)
+        else:
+            send_message("Comando no reconocido.", chat_id)
+    else:
+        # Conversación normal → OpenAI
+        reply = gpt_reply(text)
+        send_message(reply, chat_id)
+
+    return jsonify({"ok": True})
+
+@app.route("/setwebhook", methods=["POST", "GET"])
+def set_webhook():
+    if not BOT_TOKEN:
+        return "BOT_TOKEN vacío", 400
+    base = request.url_root.replace("http://", "https://").rstrip("/")
     url = f"{base}/webhook"
-    r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook", params={"url": url})
+    tg = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    r = requests.post(tg, json={"url": url, "allowed_updates": ["message", "edited_message"]}, timeout=15)
     return jsonify(r.json())
 
-# =========================
-# Local run
-# =========================
+@app.route("/tv", methods=["POST"])
+def tradingview_in():
+    """
+    Webhook para TradingView. Puedes enviar cualquier JSON y se reenviará al chat.
+    Ejemplo payload en TradingView:
+      {
+        "symbol": "{{ticker}}",
+        "tf": "{{interval}}",
+        "event": "Breakout detectado",
+        "note": "Detalle opcional"
+      }
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        text = "📨 *TradingView*\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+        send_message(text, parse_mode="Markdown")
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.exception("Error en /tv: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ---------- Scheduler ----------
+
+scheduler = BackgroundScheduler(timezone=TIMEZONE)
+scheduler.add_job(check_watchers, "interval", minutes=5, id="watchers")
+scheduler.start()
+
+# ---------- Main ----------
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
