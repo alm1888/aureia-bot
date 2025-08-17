@@ -1,9 +1,4 @@
-flask==3.0.3
-gunicorn==23.0.0
-requests==2.32.3
-apscheduler==3.10.4
-pytz==2024.1
-pandas==2.2.2
-numpy==1.26.4
-yfinance==0.2.43
-openai==1.35.10
+flask
+gunicorn
+requests
+openai>=1.40.0
